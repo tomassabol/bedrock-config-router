@@ -1,0 +1,24 @@
+{
+  "title": "compliance",
+  "type": "object",
+  "required": ["allowedModelPrefixes", "guardrail", "logPrompts"],
+  "additionalProperties": false,
+  "properties": {
+    "allowedModelPrefixes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "guardrail": {
+      "type": "object",
+      "required": ["enabled", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "version": { "type": "string", "pattern": "^([0-9]+|DRAFT)$" },
+        "streamProcessingMode": { "type": "string", "enum": ["sync", "async"] }
+      }
+    },
+    "logPrompts": { "type": "boolean" }
+  }
+}

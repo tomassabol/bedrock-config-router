@@ -1,0 +1,9 @@
+{
+  "allowedModelPrefixes": ["eu."],
+  "guardrail": {
+    "enabled": true,
+    "version": "1",
+    "streamProcessingMode": "async"
+  },
+  "logPrompts": false
+}

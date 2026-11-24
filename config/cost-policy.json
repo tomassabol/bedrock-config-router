@@ -1,0 +1,17 @@
+{
+  "maxInputChars": 40000,
+  "maxOutputTokensCap": 2048,
+  "downgrade": {
+    "enabled": true,
+    "inputCharsThreshold": 12000,
+    "model": "eu.amazon.nova-micro-v1:0",
+    "exemptRoutes": ["reasoning"]
+  },
+  "pricesPer1kTokensUsd": {
+    "eu.amazon.nova-micro-v1:0": { "input": 0.000035, "output": 0.00014 },
+    "eu.amazon.nova-lite-v1:0": { "input": 0.00006, "output": 0.00024 },
+    "eu.amazon.nova-pro-v1:0": { "input": 0.0008, "output": 0.0032 },
+    "eu.amazon.nova-2-lite-v1:0": { "input": 0.0003, "output": 0.0025 },
+    "global.amazon.nova-2-lite-v1:0": { "input": 0.0003, "output": 0.0025 }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "title": "cost-policy",
+  "type": "object",
+  "required": ["maxInputChars", "maxOutputTokensCap", "downgrade", "pricesPer1kTokensUsd"],
+  "additionalProperties": false,
+  "properties": {
+    "maxInputChars": { "type": "integer", "minimum": 1 },
+    "maxOutputTokensCap": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "downgrade": {
+      "type": "object",
+      "required": ["enabled", "inputCharsThreshold", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "inputCharsThreshold": { "type": "integer", "minimum": 1 },
+        "model": { "type": "string" },
+        "exemptRoutes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "pricesPer1kTokensUsd": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["input", "output"],
+        "additionalProperties": false,
+        "properties": {
+          "input": { "type": "number", "minimum": 0 },
+          "output": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
