@@ -1,94 +1,52 @@
 # bedrock-config-router
 
-A config-driven gateway for Amazon Bedrock (Nova models). Routing, A/B tests, cost rules, guardrails and kill switches live in **AWS AppConfig**, and the Lambda reads them through the **AppConfig Lambda extension**. You change behaviour by deploying config, not code. Each change is validated, rolled out gradually and rolled back automatically if alarms fire.
+A minimal example of runtime configuration for a GenAI Lambda. The Bedrock model, system prompt and inference settings live in **AWS AppConfig**, not in code or environment variables. The **AppConfig Lambda extension** caches them in the function, so switching from Nova 2 Lite to Nova Micro is a config deployment, not a code deployment.
 
 ```
- client ──SigV4──► API Gateway (REST, response streaming, IAM auth)
-                        │
-                        ▼
-                 Router Lambda (Node 22, arm64, Powertools logger + metrics)
-                  ├─ AppConfig extension ── localhost:2772 cache, polls every 30s
-                  ├─ policy: kill switch → route → limits → A/B variant → cost downgrade → compliance
-                  └─ Bedrock ConverseStream, falls back to the next model if one fails before the first token
-                        │
-                        ▼
-               Nova 2 Lite · Nova Pro · Nova Lite · Nova Micro   (eu.* inference profiles)
-                 + Bedrock Guardrail (version chosen in config)
-
- config/*.json ──validate──► AppConfig hosted version ──canary deployment──► extension
-                                       ▲                                       │
-                                       └──── auto-rollback ◄── CloudWatch alarms (RequestFailed, Lambda Errors)
+client ──SigV4──► API Gateway (REST, response streaming, IAM auth)
+                       │
+                       ▼
+                Lambda (Node 22) ──► Bedrock ConverseStream (Amazon Nova)
+                  └─ AppConfig extension: localhost:2772, refreshes every 15s
+                       ▲
+config/model.json ──► AppConfig (validated by config/model.schema.json)
 ```
 
-## Config profiles
+| File | What it is |
+|---|---|
+| [lib/router-stack.ts](lib/router-stack.ts) | CDK: AppConfig app/env/profile, Lambda + extension layer, streaming API |
+| [src/router/index.ts](src/router/index.ts) | Handler: read config from the extension, stream the Bedrock reply |
+| [config/model.json](config/model.json) | The runtime config: `enabled`, `modelId`, `systemPrompt`, `maxTokens`, `temperature` |
+| [scripts/chat.sh](scripts/chat.sh) | Calls the API with `curl --aws-sigv4` |
+| [scripts/deploy-config.sh](scripts/deploy-config.sh) | Pushes `config/model.json` to AppConfig without touching the Lambda |
 
-| Profile | File | What it controls |
-|---|---|---|
-| `routing` | [config/routing.json](config/routing.json) | Routes (`chat`, `summarize`, `reasoning`) → weighted variants → ordered model fallback list, system prompt, inference params |
-| `cost-policy` | [config/cost-policy.json](config/cost-policy.json) | Input size limit, output token cap, downgrade to Nova Micro above a prompt-size threshold, prices used for the `EstimatedCostUsd` metric |
-| `compliance` | [config/compliance.json](config/compliance.json) | Allowed model prefixes (e.g. only `eu.` for data residency), guardrail on/off and version, whether prompts are logged |
-| `flags` | [config/flags.json](config/flags.json) | AppConfig feature flags: `maintenance-mode`, `ab-testing`, `model-fallback` |
+## Run it
 
-AppConfig enforces the JSON Schemas in [config/schemas](config/schemas) on every new version. `npm run config:validate` also runs cross-profile checks, such as "every routed model is allowed by compliance and has a price".
-
-The Lambda bundles the same files as a fallback, so it can still serve requests if the extension can't reach AppConfig on a cold start.
-
-## Usage
-
-Requires Node 22+ and AWS credentials for eu-central-1 (the npm scripts use `AWS_PROFILE`).
+Requires [Bun](https://bun.sh), the AWS CLI, `jq`, and AWS credentials for eu-central-1.
 
 ```bash
-npm install
-npm test
-AWS_PROFILE=tomassabol npm run deploy
+bun install
+AWS_PROFILE=tomassabol bun run deploy
+AWS_PROFILE=tomassabol bun run chat "Explain AWS AppConfig in two sentences"
 ```
 
-Chat (SigV4-signed, streamed as server-sent events):
+## Change the model without deploying code
+
+Edit `config/model.json`, for example `"modelId": "eu.amazon.nova-micro-v1:0"`, then run:
 
 ```bash
-AWS_PROFILE=tomassabol npm run chat -- "Explain AppConfig in two sentences" --user alice
-AWS_PROFILE=tomassabol npm run chat -- "Summarize: ..." --route summarize
+AWS_PROFILE=tomassabol bun run config:deploy
 ```
 
-Change runtime behaviour without a code deploy: edit a file in `config/`, then run
+Running functions pick up the new config within about 15–30 seconds. The `x-model` and `x-config-version` response headers show which config served each request. Set `"enabled": false` to make the API return 503, which works as a kill switch.
 
-```bash
-AWS_PROFILE=tomassabol npm run config:deploy -- routing                       # canary: 20%/min, 5 min bake
-AWS_PROFILE=tomassabol npm run config:deploy -- flags --strategy immediate    # kill switch
-```
+AppConfig rejects any version that doesn't match [config/model.schema.json](config/model.schema.json), so a typo never reaches the function.
 
-### Request
+## Logs and metrics
 
-`POST /chat`
-
-```json
-{ "prompt": "hi", "route": "chat", "userId": "alice", "maxTokens": 512 }
-```
-
-You can send `messages: [{ "role": "user", "content": "..." }]` instead of `prompt`. `userId` makes the A/B assignment sticky; if it's omitted, the caller's IAM ARN is used.
-
-### Response (`text/event-stream`)
-
-```
-event: meta   {"route":"chat","variant":"control","model":"eu.amazon.nova-2-lite-v1:0","fallbacks":0,"configVersions":{...}}
-event: delta  {"text":"..."}
-event: done   {"stopReason":"end_turn","usage":{...},"estimatedCostUsd":0.0000412}
-```
-
-Errors found before the stream starts return a normal status code with a JSON body: 400, 403 (no compliant model), 413, 503 (maintenance) or 502 (every model failed).
-
-## Observability
-
-The Powertools Logger writes structured JSON logs. Each request's log lines include route, variant and the config versions in effect. Prompts are logged only when `compliance.logPrompts` is `true`.
-
-Powertools Metrics are published to the `BedrockConfigRouter` namespace:
-
-- **Service level:** `Requests`, `Rejected`, `RequestFailed`, `ConfigBundledFallback`
-- **Per `Route`/`Variant`/`Model`:** `ModelRequests`, `InputTokens`, `OutputTokens`, `EstimatedCostUsd`, `TimeToFirstTokenMs`, `LatencyMs`, `Fallbacks`, `Downgraded`, `GuardrailIntervened`
+Powertools writes structured JSON logs that include `modelId` and `configVersion`. Metrics go to the `BedrockConfigRouter` namespace: `InputTokens` and `OutputTokens` per `Model`, plus `Errors`.
 
 ## Notes
 
-- **Propagation isn't instant.** The extension polls every 30s (`AWS_APPCONFIG_EXTENSION_POLL_INTERVAL_SECONDS`), so after a deployment completes, warm environments pick up the change within about 30–60s. Lower the interval for faster propagation at the cost of more AppConfig calls.
-- **Gradual deployments roll out by execution environment, not by request.**
-- **The guardrail version is chosen in `compliance.json`.** CDK creates version `1`. Publish a new version and switch to it through config when you're ready.
-- **Prices in `cost-policy.json` are approximate.** Check the current Bedrock pricing for your region.
+- **Propagation is polling, not push.** Lambda environments are frozen between requests, so changes arrive at the next poll. 15 seconds is the shortest interval AppConfig allows.
+- **The rollout is immediate.** Each deployment uses a strategy with no gradual rollout. For production, use a linear or canary strategy and attach CloudWatch alarms to the environment so a bad config rolls back automatically.

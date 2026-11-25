@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["enabled", "modelId", "maxTokens"],
+  "additionalProperties": false,
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "modelId": { "type": "string", "pattern": "^(eu|us|apac|global)\\.amazon\\.nova-" },
+    "systemPrompt": { "type": "string" },
+    "maxTokens": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "temperature": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

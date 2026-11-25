@@ -1,142 +1,87 @@
-import { BedrockRuntimeClient, type ConverseStreamOutput } from '@aws-sdk/client-bedrock-runtime';
+import { BedrockRuntimeClient, ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { Logger } from '@aws-lambda-powertools/logger';
 import { Metrics, MetricUnit } from '@aws-lambda-powertools/metrics';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { openStreamWithFallback } from './bedrock';
-import { loadRuntimeConfig } from './config';
-import { estimateCostUsd, PolicyError, resolvePlan } from './policy';
-import type { ChatRequest } from './types';
 
-const SERVICE = 'bedrock-config-router';
-const NAMESPACE = process.env.POWERTOOLS_METRICS_NAMESPACE ?? 'BedrockConfigRouter';
+interface ModelConfig {
+  enabled: boolean;
+  modelId: string;
+  systemPrompt?: string;
+  maxTokens: number;
+  temperature?: number;
+}
 
-const logger = new Logger({ serviceName: SERVICE });
-const metrics = new Metrics({ namespace: NAMESPACE, serviceName: SERVICE });
-const bedrock = new BedrockRuntimeClient({ maxAttempts: 2 });
+const logger = new Logger();
+const metrics = new Metrics();
+const bedrock = new BedrockRuntimeClient();
 
-const sse = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+// The AppConfig extension serves the cached config on localhost and refreshes it in the background.
+const CONFIG_URL = `http://localhost:2772/applications/${process.env.APPCONFIG_APPLICATION}/environments/${process.env.APPCONFIG_ENVIRONMENT}/configurations/model`;
 
-function writeJson(stream: awslambda.ResponseStream, statusCode: number, body: unknown) {
-  const out = awslambda.HttpResponseStream.from(stream, {
-    statusCode,
-    headers: { 'content-type': 'application/json' },
-  });
+async function getConfig() {
+  const res = await fetch(CONFIG_URL);
+  if (!res.ok) throw new Error(`AppConfig extension returned ${res.status}`);
+  return { config: (await res.json()) as ModelConfig, version: res.headers.get('Configuration-Version') ?? '?' };
+}
+
+function parsePrompt(body: string | null): string | undefined {
+  try {
+    const prompt = JSON.parse(body ?? '{}').prompt;
+    return typeof prompt === 'string' && prompt.trim() ? prompt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sendJson(stream: awslambda.ResponseStream, statusCode: number, body: unknown) {
+  const out = awslambda.HttpResponseStream.from(stream, { statusCode, headers: { 'content-type': 'application/json' } });
   // write() then end(): end(data) right after from() can drop the prelude, which API Gateway reports as a 502.
   out.write(JSON.stringify(body));
   out.end();
 }
 
-function parseBody(event: APIGatewayProxyEvent): ChatRequest {
-  if (!event.body) throw new PolicyError(400, 'Missing request body');
-  const raw = event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf8') : event.body;
-  try {
-    return JSON.parse(raw) as ChatRequest;
-  } catch {
-    throw new PolicyError(400, 'Body must be valid JSON');
-  }
-}
-
 export const handler = awslambda.streamifyResponse<APIGatewayProxyEvent>(async (event, responseStream, context) => {
   logger.addContext(context);
-  const started = Date.now();
-  metrics.addMetric('Requests', MetricUnit.Count, 1);
-
+  let out: awslambda.ResponseStream | undefined;
   try {
-    const cfg = await loadRuntimeConfig(logger);
-    if (cfg.usedBundledFallback) metrics.addMetric('ConfigBundledFallback', MetricUnit.Count, 1);
+    const { config, version } = await getConfig();
+    logger.appendKeys({ modelId: config.modelId, configVersion: version });
 
-    const req = parseBody(event);
-    const subjectId = req.userId ?? event.requestContext?.identity?.userArn ?? context.awsRequestId;
-    const plan = resolvePlan(req, cfg, subjectId, process.env.GUARDRAIL_ID);
+    if (!config.enabled) return sendJson(responseStream, 503, { error: 'Service disabled by config' });
 
-    logger.appendKeys({ route: plan.route, variant: plan.variant, configVersions: cfg.versions });
-    logger.info('Resolved plan', {
-      models: plan.models,
-      downgraded: plan.downgraded,
-      guardrail: plan.guardrail ? `${plan.guardrail.id}:${plan.guardrail.version}` : 'off',
-      inputChars: plan.inputChars,
-      ...(cfg.compliance.logPrompts ? { messages: plan.messages } : {}),
-    });
+    const prompt = parsePrompt(event.body);
+    if (!prompt) return sendJson(responseStream, 400, { error: 'Missing "prompt"' });
 
-    const opened = await openStreamWithFallback(bedrock, plan, logger);
-    const ttfbMs = Date.now() - started;
-
-    // Headers are committed only now, after a model accepted the request.
-    const out = awslambda.HttpResponseStream.from(responseStream, {
-      statusCode: 200,
-      headers: {
-        'content-type': 'text/event-stream',
-        'cache-control': 'no-cache',
-        'x-route': plan.route,
-        'x-variant': plan.variant,
-        'x-model': opened.model,
-      },
-    });
-    out.write(
-      sse('meta', {
-        route: plan.route,
-        variant: plan.variant,
-        model: opened.model,
-        fallbacks: opened.fallbacks,
-        downgraded: plan.downgraded,
-        configVersions: cfg.versions,
+    const { stream } = await bedrock.send(
+      new ConverseStreamCommand({
+        modelId: config.modelId,
+        system: config.systemPrompt ? [{ text: config.systemPrompt }] : undefined,
+        messages: [{ role: 'user', content: [{ text: prompt }] }],
+        inferenceConfig: { maxTokens: config.maxTokens, temperature: config.temperature },
       }),
     );
 
-    let usage: { inputTokens?: number; outputTokens?: number } = {};
-    let stopReason: string | undefined;
-    const handle = (ev: ConverseStreamOutput) => {
-      const text = ev.contentBlockDelta?.delta?.text;
-      if (text) out.write(sse('delta', { text }));
-      if (ev.messageStop) stopReason = ev.messageStop.stopReason;
-      if (ev.metadata?.usage) usage = ev.metadata.usage;
-    };
-
-    let streamFailed = false;
-    try {
-      if (!opened.first.done) handle(opened.first.value);
-      for (let r = await opened.rest.next(); !r.done; r = await opened.rest.next()) handle(r.value);
-    } catch (error) {
-      // Tokens already went out, so we can't switch model or status code: report in-band.
-      streamFailed = true;
-      logger.error('Stream failed mid-response', { error });
-      out.write(sse('error', { message: 'Upstream model stream failed' }));
-    }
-
-    const costUsd = estimateCostUsd(cfg, opened.model, usage);
-    out.write(sse('done', { stopReason, usage, estimatedCostUsd: Number(costUsd.toFixed(8)) }));
-    out.end();
-
-    if (streamFailed) metrics.addMetric('RequestFailed', MetricUnit.Count, 1);
-
-    // Per-model metrics in their own EMF blob so they get Route/Variant/Model dimensions.
-    const perModel = new Metrics({
-      namespace: NAMESPACE,
-      serviceName: SERVICE,
-      defaultDimensions: { Route: plan.route, Variant: plan.variant, Model: opened.model },
+    out = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8', 'x-model': config.modelId, 'x-config-version': version },
     });
-    perModel.addMetric('ModelRequests', MetricUnit.Count, 1);
-    perModel.addMetric('InputTokens', MetricUnit.Count, usage.inputTokens ?? 0);
-    perModel.addMetric('OutputTokens', MetricUnit.Count, usage.outputTokens ?? 0);
-    perModel.addMetric('EstimatedCostUsd', MetricUnit.NoUnit, costUsd);
-    perModel.addMetric('TimeToFirstTokenMs', MetricUnit.Milliseconds, ttfbMs);
-    perModel.addMetric('LatencyMs', MetricUnit.Milliseconds, Date.now() - started);
-    perModel.addMetric('Fallbacks', MetricUnit.Count, opened.fallbacks);
-    perModel.addMetric('Downgraded', MetricUnit.Count, plan.downgraded ? 1 : 0);
-    perModel.addMetric('GuardrailIntervened', MetricUnit.Count, stopReason === 'guardrail_intervened' ? 1 : 0);
-    perModel.publishStoredMetrics();
-
-    logger.info('Completed', { model: opened.model, stopReason, usage, costUsd, latencyMs: Date.now() - started });
-  } catch (error) {
-    if (error instanceof PolicyError) {
-      metrics.addMetric('Rejected', MetricUnit.Count, 1);
-      logger.info('Request rejected by policy', { statusCode: error.statusCode, reason: error.message });
-      writeJson(responseStream, error.statusCode, { error: error.message });
-    } else {
-      metrics.addMetric('RequestFailed', MetricUnit.Count, 1);
-      logger.error('All models failed', { error });
-      writeJson(responseStream, 502, { error: 'All candidate models failed' });
+    for await (const chunk of stream ?? []) {
+      const text = chunk.contentBlockDelta?.delta?.text;
+      if (text) out.write(text);
+      if (chunk.metadata?.usage) {
+        metrics.addDimension('Model', config.modelId);
+        metrics.addMetric('InputTokens', MetricUnit.Count, chunk.metadata.usage.inputTokens ?? 0);
+        metrics.addMetric('OutputTokens', MetricUnit.Count, chunk.metadata.usage.outputTokens ?? 0);
+        logger.info('Completed', { usage: chunk.metadata.usage });
+      }
     }
+    out.end();
+  } catch (error) {
+    logger.error('Request failed', { error });
+    metrics.addMetric('Errors', MetricUnit.Count, 1);
+    // Once streaming has started the status code is already sent, so just close the stream.
+    if (out) out.end();
+    else sendJson(responseStream, 500, { error: 'Request failed' });
   } finally {
     metrics.publishStoredMetrics();
     logger.resetKeys();

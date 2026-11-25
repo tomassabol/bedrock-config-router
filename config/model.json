@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "modelId": "eu.amazon.nova-2-lite-v1:0",
+  "systemPrompt": "You are a concise, helpful assistant.",
+  "maxTokens": 1024,
+  "temperature": 0.5
+}
